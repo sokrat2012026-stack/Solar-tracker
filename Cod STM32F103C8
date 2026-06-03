@@ -1,0 +1,804 @@
+/* ============================================================================
+   ФАЙЛ: main.c
+   ПРОЕКТ: Интеллектуальная система управления солнечной электростанцией
+   АВТОР: Темербеков М.Б.
+   КОНТРОЛЛЕР: STM32F103C8 (ARM Cortex-M3, 72 МГц, 64KB Flash, 20KB RAM)
+   
+   НАЗНАЧЕНИЕ:
+   - Главный контроллер солнечного трекера (НИЖНИЙ УРОВЕНЬ)
+   - Управление двигателями через драйверы BTS7960
+   - Чтение всех датчиков (AS5600, INA219, DS18B20, WF105)
+   - Обработка аварий (ветер >15 м/с, перегрев, низкий АКБ)
+   - Обмен данными с ESP32 по UART
+   - Отображение информации на LCD 1602
+   
+   ВАЖНО: STM32 работает АВТОНОМНО даже без связи с ESP32!
+   ============================================================================ */
+/*------------------------------------------------------------------------------
+  БЛОК 1: ЗАГОЛОВОЧНЫЕ ФАЙЛЫ STM32 (генерируются CubeMX)
+------------------------------------------------------------------------------*/
+#include "main.h"      // Основной файл HAL (Hardware Abstraction Layer)
+#include "i2c.h"       // I2C интерфейс (для AS5600, INA219)
+#include "usart.h"     // UART интерфейс (связь с ESP32)
+#include "tim.h"       // Таймеры для генерации ШИМ (управление скоростью)
+#include "gpio.h"      // GPIO пины (концевики, кнопки, светодиоды)
+/*------------------------------------------------------------------------------
+  БЛОК 2: СТАНДАРТНЫЕ БИБЛИОТЕКИ C
+------------------------------------------------------------------------------*/
+#include <string.h>    // strstr() - поиск подстроки в команде
+#include <stdio.h>     // sprintf() - форматирование строк для UART и LCD
+#include <stdlib.h>    // Абсолютные значения, преобразования
+/*------------------------------------------------------------------------------
+  БЛОК 3: ПЕРЕЧИСЛЕНИЕ СОСТОЯНИЙ СИСТЕМЫ
+  (Согласно блок-схеме алгоритма)
+------------------------------------------------------------------------------*/
+typedef enum {
+  STATE_INIT = 0,      // 0: Начальная инициализация, проверка датчиков
+  STATE_AUTO,          // 1: Автоматическое слежение за солнцем
+  STATE_MANUAL,        // 2: Ручной режим (команды из Blynk)
+  STATE_NIGHT,         // 3: Ночной режим (панель в безопасном положении)
+  STATE_PARKING,       // 4: Аварийная парковка (движение в горизонталь)
+  STATE_PARKED         // 5: Панель запаркована, трекинг заблокирован
+} SystemState_t;
+/*------------------------------------------------------------------------------
+  БЛОК 4: ПЕРЕЧИСЛЕНИЕ КОДОВ АВАРИЙ
+  (Для отправки в Blynk и Telegram)
+------------------------------------------------------------------------------*/
+typedef enum {
+  ALARM_NONE = 0,          // 0: Аварий нет
+  ALARM_WIND_HIGH = 1,     // 1: Ветер > 15 м/с
+  ALARM_BATTERY_LOW = 2,   // 2: Напряжение АКБ < 21 В
+  ALARM_PANEL_OVERHEAT = 3,// 3: Температура панели > 75°C
+  ALARM_BOX_OVERHEAT = 4,  // 4: Температура шкафа > 50°C
+  ALARM_MOTOR_OVERLOAD = 5,// 5: Ток двигателя > 15 А
+  ALARM_STM32_ESP_LOST = 6,// 6: Потеря связи с ESP32 (>10 секунд)
+  ALARM_SENSOR_ERROR = 7   // 7: Датчик не отвечает
+} AlarmCode_t;
+/*------------------------------------------------------------------------------
+  БЛОК 5: СТРУКТУРА ДАННЫХ С ВСЕХ ДАТЧИКОВ
+  (Полностью соответствует структурной схеме)
+------------------------------------------------------------------------------*/
+typedef struct {
+  // ----- ЭЛЕКТРИЧЕСКИЕ ПАРАМЕТРЫ (INA219) -----
+  float voltage_panel_v;      // Напряжение солнечной панели (0-26 В)
+  float current_panel_a;      // Ток солнечной панели (0-3.2 А)
+  float power_panel_w;        // Мощность = U * I (Вт)
+  float voltage_battery_v;    // Напряжение аккумулятора 24 В
+  float current_motor_a;      // Ток потребления двигателей (защита)
+  
+  // ----- ДАТЧИКИ ПОЛОЖЕНИЯ (AS5600 магнитные энкодеры) -----
+  float azimuth_deg;          // Угол азимута (0-360°)
+  float elevation_deg;        // Угол места (-90° до +90°)
+  
+  // ----- МЕТЕОДАННЫЕ (WF105 анемометр) -----
+  float wind_speed_mps;       // Скорость ветра (0-30 м/с)
+  
+  // ----- ДАТЧИКИ ТЕМПЕРАТУРЫ (DS18B20 1-Wire) -----
+  float temp_panel_c;         // Температура солнечной панели
+  float temp_box_c;           // Температура шкафа управления
+  float temp_inverter_c;      // Температура инвертора (опционально)
+  
+  // ----- ДАТЧИКИ СЛЕЖЕНИЯ ЗА СОЛНЦЕМ (2 фотодиода) -----
+  uint16_t light_left;        // Левый датчик (ADC 0-4095)
+  uint16_t light_right;       // Правый датчик (ADC 0-4095)
+  
+  // ----- КОНЦЕВЫЕ ВЫКЛЮЧАТЕЛИ (защита актуаторов) -----
+  uint8_t limit_az_min;       // Концевик минимума азимута
+  uint8_t limit_az_max;       // Концевик максимума азимута
+  uint8_t limit_el_min;       // Концевик минимума угла места
+  uint8_t limit_el_max;       // Концевик максимума угла места
+  
+  // ----- СТАТИСТИКА -----
+  float energy_today_wh;      // Выработка за сегодня (Вт·ч)
+  uint16_t parking_count;     // Счётчик аварийных парковок
+} SensorData_t;
+/*------------------------------------------------------------------------------
+  БЛОК 6: ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+------------------------------------------------------------------------------*/
+static SystemState_t systemState = STATE_INIT;   // Текущее состояние системы
+static AlarmCode_t currentAlarm = ALARM_NONE;    // Текущий код аварии
+static uint32_t lastCycleTime = 0;               // Время последнего цикла
+static uint32_t lastUARTSendTime = 0;            // Время последней отправки
+static uint32_t lastLCDUpdateTime = 0;           // Время последнего обновления LCD
+static uint32_t lastEnergyCalcTime = 0;          // Время последнего расчёта энергии
+static uint8_t rxBuffer[64];                     // Буфер приёма от ESP32
+static uint8_t rxIndex = 0;                      // Индекс в буфере
+static uint32_t lastCommandTime = 0;             // Время последней команды от ESP32
+static SensorData_t sensors = {0};               // Все данные с датчиков
+static float energy_accumulator = 0.0f;          // Аккумулятор энергии (Вт·ч)
+// Флаги для ручного управления (из Blynk)
+static uint8_t manual_az_cmd = 0;   // 0=нет, 1=влево, 2=вправо
+static uint8_t manual_el_cmd = 0;   // 0=нет, 1=вниз, 2=вверх
+/*------------------------------------------------------------------------------
+  БЛОК 7: АДРЕСА ДАТЧИКОВ И ПОРОГОВЫЕ ЗНАЧЕНИЯ
+------------------------------------------------------------------------------*/
+// I2C адреса для AS5600 (можно менять перемычками на плате)
+#define AS5600_ADDR_AZ     0x36  // Энкодер азимута
+#define AS5600_ADDR_EL     0x37  // Энкодер угла места
+// I2C адреса для INA219 (задаются перемычками A0, A1)
+#define INA219_ADDR_PANEL  0x40  // Монитор солнечной панели
+#define INA219_ADDR_BATTERY 0x41 // Монитор аккумулятора
+#define INA219_ADDR_MOTOR  0x44  // Монитор тока двигателей
+// Идентификаторы датчиков DS18B20 (уникальные 64-битные коды)
+#define DS18B20_PANEL      0     // Датчик на панели
+#define DS18B20_BOX        1     // Датчик в шкафу
+#define DS18B20_INVERTER   2     // Датчик инвертора
+// Каналы АЦП (12-бит, 0-4095)
+#define ADC_CH_LIGHT_LEFT  0     // Левый фотодиод
+#define ADC_CH_LIGHT_RIGHT 1     // Правый фотодиод
+#define ADC_CH_WIND        2     // Анемометр WF105 (0-5В -> 0-30 м/с)
+// ПОРОГОВЫЕ ЗНАЧЕНИЯ ДЛЯ АВАРИЙ (согласно документации)
+#define WIND_ALARM_THRESHOLD    15.0f   // Ветер > 15 м/с - парковка
+#define BATTERY_MIN_VOLTAGE     21.0f   // АКБ 24В разряжен (<21В)
+#define TEMP_PANEL_MAX          75.0f   // Панель перегрета (>75°C)
+#define TEMP_BOX_MAX            50.0f   // Шкаф перегрет (>50°C)
+#define MOTOR_MAX_CURRENT       15.0f   // Перегрузка двигателя (>15А)
+// Параметры слежения
+#define TRACKING_DEADBAND       50      // Мёртвая зона (ADC отсчёты)
+#define PWM_AUTO_SPEED          50      // 50% скорости в авторежиме
+#define PWM_PARKING_SPEED       80      // 80% скорости при парковке
+#define PWM_MANUAL_SPEED        70      // 70% скорости в ручном режиме
+/*------------------------------------------------------------------------------
+  БЛОК 8: ПРОТОТИПЫ ФУНКЦИЙ
+------------------------------------------------------------------------------*/
+void SystemClock_Config(void);      // Настройка тактовой частоты (72 МГц)
+static void MX_NVIC_Init(void);     // Настройка прерываний
+void readAllSensors(void);          // Чтение ВСЕХ датчиков
+void checkEmergencyAndPark(void);   // Проверка аварий и парковка
+void controlActuators(void);        // Управление двигателями
+void sendTelemetryToESP32(void);    // Отправка данных в ESP32
+void updateLCD(void);               // Обновление дисплея 1602
+void calculateEnergy(void);         // Расчёт выработки энергии
+void parseReceivedCommand(char *cmd); // Разбор команд от ESP32
+void sendAlarmToESP32(void);        // Отправка аварии в ESP32
+// ----- ДРАЙВЕРЫ ДАТЧИКОВ (реализация внизу) -----
+void AS5600_Init(void);
+float AS5600_ReadAngle(uint8_t addr);
+void INA219_Init(void);
+float INA219_ReadVoltage(uint8_t addr);
+float INA219_ReadCurrent(uint8_t addr);
+void DS18B20_Init(void);
+float DS18B20_ReadTemp(uint8_t sensor_id);
+float WF105_ReadWindSpeed(void);
+uint16_t readLightSensor(uint8_t channel);
+// ----- ФУНКЦИИ УПРАВЛЕНИЯ ДВИГАТЕЛЯМИ -----
+void Motor_Azimuth_Left(uint8_t speed);
+void Motor_Azimuth_Right(uint8_t speed);
+void Motor_Azimuth_Stop(void);
+void Motor_Elevation_Up(uint8_t speed);
+void Motor_Elevation_Down(uint8_t speed);
+void Motor_Elevation_Stop(void);
+void Motor_All_Stop(void);
+// ----- ФУНКЦИИ LCD -----
+void LCD_Init(void);
+void LCD_Clear(void);
+void LCD_SetCursor(uint8_t col, uint8_t row);
+void LCD_Print(const char* str);
+/*==============================================================================
+  БЛОК 9: ОБРАБОТЧИК ПРЕРЫВАНИЯ UART (ПРИЁМ ОТ ESP32)
+  ==============================================================================
+  Формат команд: <CMD;AUTO> или <CMD;AZ_PLUS>
+  Символ '<' - начало команды, '>' - конец команды
+==============================================================================*/
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  // Проверяем, что прерывание пришло от USART1 (к ESP32)
+  if(huart->Instance == USART1)
+  {
+    static uint8_t receivedByte;  // Статическая - сохраняет значение между вызовами
+    
+    // Если пришёл символ '<' - начинаем новую команду
+    if(receivedByte == '<')
+      rxIndex = 0;                 // Сбрасываем указатель буфера
+    
+    // Сохраняем принятый байт в буфер
+    rxBuffer[rxIndex++] = receivedByte;
+    
+    // Если пришёл символ '>' и буфер не пуст - команда завершена
+    if(receivedByte == '>' && rxIndex > 2)
+    {
+      rxBuffer[rxIndex] = '\0';               // Добавляем завершающий ноль
+      parseReceivedCommand((char*)rxBuffer);  // Разбираем команду
+      rxIndex = 0;                            // Сбрасываем буфер
+    }
+    
+    // Включаем приём следующего байта
+    HAL_UART_Receive_IT(&huart1, &receivedByte, 1);
+  }
+}
+/*==============================================================================
+  БЛОК 10: ГЛАВНАЯ ФУНКЦИЯ main()
+  ==============================================================================
+  Точка входа в программу. Выполняется при включении питания.
+==============================================================================*/
+int main(void)
+{
+  /*----------------------------------------------------------------------------
+    ШАГ 1: ИНИЦИАЛИЗАЦИЯ АППАРАТУРЫ (CubeMX)
+  ----------------------------------------------------------------------------*/
+  HAL_Init();                      // Инициализация HAL (Hardware Abstraction Layer)
+  SystemClock_Config();            // Настройка тактов: HSE 8МГц -> PLL -> 72МГц
+  MX_GPIO_Init();                  // Настройка пинов: концевики, кнопки, LED
+  MX_I2C1_Init();                  // I2C: скорость 100 кГц, пины PB6/PB7
+  MX_USART1_UART_Init();           // UART: 115200 бод, 8 бит, 1 стоп, без чётности
+  MX_TIM2_Init();                  // Таймер 2: ШИМ для азимута (частота ~1 кГц)
+  MX_TIM3_Init();                  // Таймер 3: ШИМ для угла места
+  MX_NVIC_Init();                  // Настройка приоритетов прерываний
+  
+  /*----------------------------------------------------------------------------
+    ШАГ 2: ИНИЦИАЛИЗАЦИЯ ДАТЧИКОВ И ПЕРИФЕРИИ
+  ----------------------------------------------------------------------------*/
+  // 2.1: Инициализация датчиков
+  AS5600_Init();      // Магнитные энкодеры (I2C)
+  INA219_Init();      // Мониторы напряжения/тока (I2C)
+  DS18B20_Init();     // Датчики температуры (1-Wire)
+  
+  // 2.2: Инициализация LCD 1602
+  LCD_Init();
+  LCD_Clear();
+  LCD_Print("Solar Tracker  ");
+  LCD_SetCursor(0, 1);
+  LCD_Print("Initializing...");
+  
+  // 2.3: Запуск UART для приёма команд от ESP32
+  uint8_t startByte;
+  HAL_UART_Receive_IT(&uart1, &startByte, 1);
+  
+  // 2.4: Начальная остановка двигателей (безопасное состояние)
+  Motor_All_Stop();
+  
+  // 2.5: Установка начальных параметров
+  systemState = STATE_AUTO;        // Стартуем в автоматическом режиме
+  lastCommandTime = HAL_GetTick(); // Запоминаем время для контроля связи
+  lastCycleTime = HAL_GetTick();
+  lastUARTSendTime = HAL_GetTick();
+  lastLCDUpdateTime = HAL_GetTick();
+  lastEnergyCalcTime = HAL_GetTick();
+  
+  // 2.6: Ждём 2 секунды для завершения инициализации
+  HAL_Delay(2000);
+  LCD_Clear();
+  
+  /*----------------------------------------------------------------------------
+    ШАГ 3: БЕСКОНЕЧНЫЙ ОСНОВНОЙ ЦИКЛ
+  ----------------------------------------------------------------------------*/
+  while (1)
+  {
+    uint32_t now = HAL_GetTick();   // Текущее время в миллисекундах
+    
+    /*--------------------------------------------------------------------------
+      ПОДШАГ 3.1: ГЛАВНЫЙ ЦИКЛ УПРАВЛЕНИЯ (каждые 100 мс)
+    --------------------------------------------------------------------------*/
+    if(now - lastCycleTime >= 100)
+    {
+      lastCycleTime = now;           // Обновляем время последнего цикла
+      
+      // 1. Чтение всех датчиков
+      readAllSensors();
+      
+      // 2. Расчёт мощности P = U * I
+      sensors.power_panel_w = sensors.voltage_panel_v * sensors.current_panel_a;
+      
+      // 3. Проверка аварийных условий (ветер, перегрев, низкий АКБ...)
+      checkEmergencyAndPark();
+      
+      // 4. Управление двигателями в зависимости от режима (AUTO/MANUAL/NIGHT)
+      controlActuators();
+      
+      // 5. Отправка данных в ESP32 каждую секунду
+      if(now - lastUARTSendTime >= 1000)
+      {
+        lastUARTSendTime = now;
+        sendTelemetryToESP32();
+      }
+    }
+    
+    /*--------------------------------------------------------------------------
+      ПОДШАГ 3.2: РАСЧЁТ ЭНЕРГИИ (каждые 60 секунд)
+      Энергия (Вт·ч) = Мощность (Вт) * Время (часы)
+    --------------------------------------------------------------------------*/
+    if(now - lastEnergyCalcTime >= 60000)
+    {
+      lastEnergyCalcTime = now;
+      calculateEnergy();     // Добавляем мощность за минуту к общему счётчику
+    }
+    
+    /*--------------------------------------------------------------------------
+      ПОДШАГ 3.3: ОБНОВЛЕНИЕ LCD (каждые 500 мс)
+      Отображаем режим, мощность, ветер, углы
+    --------------------------------------------------------------------------*/
+    if(now - lastLCDUpdateTime >= 500)
+    {
+      lastLCDUpdateTime = now;
+      updateLCD();
+    }
+    
+    // Небольшая задержка для снижения нагрузки на процессор
+    HAL_Delay(10);
+  }
+}
+/*==============================================================================
+  БЛОК 11: ЧТЕНИЕ ВСЕХ ДАТЧИКОВ
+  ==============================================================================
+  Согласно структурной схеме, читаем:
+  - INA219: напряжение панели, ток панели, напряжение АКБ, ток двигателя
+  - AS5600: угол азимута, угол места
+  - WF105: скорость ветра
+  - DS18B20: температуры (панель, шкаф, инвертор)
+  - Фотодиоды: освещённость (левый/правый)
+  - Концевики: состояние конечных выключателей
+==============================================================================*/
+void readAllSensors(void)
+{
+  // ----- 1. ЭЛЕКТРИЧЕСКИЕ ПАРАМЕТРЫ (INA219) -----
+  // INA219 - 12-битный ADC с программируемым усилением
+  sensors.voltage_panel_v = INA219_ReadVoltage(INA219_ADDR_PANEL);
+  sensors.current_panel_a = INA219_ReadCurrent(INA219_ADDR_PANEL);
+  sensors.voltage_battery_v = INA219_ReadVoltage(INA219_ADDR_BATTERY);
+  sensors.current_motor_a = INA219_ReadCurrent(INA219_ADDR_MOTOR);
+  
+  // ----- 2. ДАТЧИКИ ПОЛОЖЕНИЯ (AS5600 магнитные энкодеры) -----
+  // AS5600 - 12-битный датчик угла, разрешение 0.088°
+  sensors.azimuth_deg = AS5600_ReadAngle(AS5600_ADDR_AZ);
+  sensors.elevation_deg = AS5600_ReadAngle(AS5600_ADDR_EL);
+  
+  // ----- 3. СКОРОСТЬ ВЕТРА (WF105 анемометр) -----
+  // Аналоговый выход 0-5В соответствует 0-30 м/с
+  sensors.wind_speed_mps = WF105_ReadWindSpeed();
+  
+  // ----- 4. ТЕМПЕРАТУРЫ (DS18B20 1-Wire) -----
+  // Точность ±0.5°C, диапазон -55..+125°C
+  sensors.temp_panel_c = DS18B20_ReadTemp(DS18B20_PANEL);
+  sensors.temp_box_c = DS18B20_ReadTemp(DS18B20_BOX);
+  sensors.temp_inverter_c = DS18B20_ReadTemp(DS18B20_INVERTER);
+  
+  // ----- 5. ДАТЧИКИ СЛЕЖЕНИЯ ЗА СОЛНЦЕМ (2 фотодиода) -----
+  // Дифференциальное включение: разница сигналов показывает направление на солнце
+  sensors.light_left = readLightSensor(ADC_CH_LIGHT_LEFT);
+  sensors.light_right = readLightSensor(ADC_CH_LIGHT_RIGHT);
+  
+  // ----- 6. КОНЦЕВЫЕ ВЫКЛЮЧАТЕЛИ (защита актуаторов) -----
+  // Читаем состояние через GPIO (подтянуты к GND через резисторы)
+  sensors.limit_az_min = HAL_GPIO_ReadPin(LIMIT_AZ_MIN_GPIO_Port, LIMIT_AZ_MIN_Pin);
+  sensors.limit_az_max = HAL_GPIO_ReadPin(LIMIT_AZ_MAX_GPIO_Port, LIMIT_AZ_MAX_Pin);
+  sensors.limit_el_min = HAL_GPIO_ReadPin(LIMIT_EL_MIN_GPIO_Port, LIMIT_EL_MIN_Pin);
+  sensors.limit_el_max = HAL_GPIO_ReadPin(LIMIT_EL_MAX_GPIO_Port, LIMIT_EL_MAX_Pin);
+}
+/*==============================================================================
+  БЛОК 12: ПРОВЕРКА АВАРИЙ И ПАРКОВКА
+  ==============================================================================
+  Проверяем 6 аварийных условий (согласно блок-схеме):
+  1. Ветер > 15 м/с
+  2. Напряжение АКБ < 21 В
+  3. Температура панели > 75°C
+  4. Температура шкафа > 50°C
+  5. Ток двигателя > 15 А
+  6. Потеря связи с ESP32 (>10 секунд)
+  
+  При любой аварии - немедленная парковка в горизонтальное положение.
+==============================================================================*/
+void checkEmergencyAndPark(void)
+{
+  uint8_t emergency = 0;   // Флаг аварии (0=нет, 1=есть)
+  
+  // ----- ПРОВЕРКА УСЛОВИЙ -----
+  if(sensors.wind_speed_mps > WIND_ALARM_THRESHOLD)
+  {
+    emergency = 1;
+    currentAlarm = ALARM_WIND_HIGH;
+  }
+  else if(sensors.voltage_battery_v < BATTERY_MIN_VOLTAGE)
+  {
+    emergency = 1;
+    currentAlarm = ALARM_BATTERY_LOW;
+  }
+  else if(sensors.temp_panel_c > TEMP_PANEL_MAX)
+  {
+    emergency = 1;
+    currentAlarm = ALARM_PANEL_OVERHEAT;
+  }
+  else if(sensors.temp_box_c > TEMP_BOX_MAX)
+  {
+    emergency = 1;
+    currentAlarm = ALARM_BOX_OVERHEAT;
+  }
+  else if(sensors.current_motor_a > MOTOR_MAX_CURRENT)
+  {
+    emergency = 1;
+    currentAlarm = ALARM_MOTOR_OVERLOAD;
+  }
+  else if(HAL_GetTick() - lastCommandTime > 10000 && systemState != STATE_PARKED)
+  {
+    emergency = 1;
+    currentAlarm = ALARM_STM32_ESP_LOST;
+  }
+  else
+  {
+    currentAlarm = ALARM_NONE;
+  }
+  
+  // ----- ПЕРЕХОД В РЕЖИМ ПАРКОВКИ -----
+  if(emergency && systemState != STATE_PARKING && systemState != STATE_PARKED)
+  {
+    systemState = STATE_PARKING;           // Активируем парковку
+    sensors.parking_count++;               // Увеличиваем счётчик парковок
+    LCD_Clear();
+    LCD_Print("EMERGENCY!     ");
+    LCD_SetCursor(0, 1);
+    LCD_Print("PARKING...     ");
+    
+    sendAlarmToESP32();                    // Отправляем аварию в ESP32
+  }
+  
+  // ----- ВЫПОЛНЕНИЕ ПАРКОВКИ (горизонтальное положение, угол места = 0°) -----
+  if(systemState == STATE_PARKING)
+  {
+    if(sensors.elevation_deg > 2.0f)       // Смотрит вверх - опускаем
+      Motor_Elevation_Down(PWM_PARKING_SPEED);
+    else if(sensors.elevation_deg < -2.0f) // Смотрит вниз - поднимаем
+      Motor_Elevation_Up(PWM_PARKING_SPEED);
+    else
+    {
+      // Достигли горизонтального положения
+      Motor_Elevation_Stop();
+      Motor_Azimuth_Stop();
+      systemState = STATE_PARKED;          // Панель запаркована
+      LCD_Clear();
+      LCD_Print("PARKED         ");
+      LCD_SetCursor(0, 1);
+      LCD_Print("Safe mode      ");
+    }
+  }
+  
+  // ----- ВОЗВРАТ В АВТОМАТИЧЕСКИЙ РЕЖИМ ПОСЛЕ УСТРАНЕНИЯ АВАРИИ -----
+  if(!emergency && systemState == STATE_PARKED)
+  {
+    systemState = STATE_AUTO;
+    LCD_Clear();
+    LCD_Print("RESUMING       ");
+    LCD_SetCursor(0, 1);
+    LCD_Print("AUTO MODE      ");
+    HAL_Delay(2000);
+  }
+}
+/*==============================================================================
+  БЛОК 13: УПРАВЛЕНИЕ АКТУАТОРАМИ
+  ==============================================================================
+  Три режима работы:
+  - AUTO: слежение за солнцем по дифференциальному сигналу фотодиодов
+  - MANUAL: управление по командам от ESP32/Blynk
+  - NIGHT: перевод панели в безопасное положение
+  
+  Защита по концевикам имеет ВЫСШИЙ ПРИОРИТЕТ!
+==============================================================================*/
+void controlActuators(void)
+{
+  // ===== ЗАЩИТА ПО КОНЦЕВЫМ ВЫКЛЮЧАТЕЛЯМ (высший приоритет) =====
+  if(sensors.limit_az_min) Motor_Azimuth_Stop();   // Достигнут левый концевик
+  if(sensors.limit_az_max) Motor_Azimuth_Stop();   // Достигнут правый концевик
+  if(sensors.limit_el_min) Motor_Elevation_Stop(); // Достигнут нижний концевик
+  if(sensors.limit_el_max) Motor_Elevation_Stop(); // Достигнут верхний концевик
+  
+  // ===== ПАРКОВКА - ДВИЖЕНИЕ ЗАПРЕЩЕНО =====
+  if(systemState == STATE_PARKED || systemState == STATE_PARKING)
+  {
+    Motor_All_Stop();
+    return;
+  }
+  
+  // ===== РЕЖИМ 1: АВТОМАТИЧЕСКОЕ СЛЕЖЕНИЕ =====
+  if(systemState == STATE_AUTO)
+  {
+    // Дифференциальный сигнал: разница между правым и левым фотодиодом
+    // errorAz > 0 -> солнце справа, поворачиваем панель вправо
+    // errorAz < 0 -> солнце слева, поворачиваем влево
+    int32_t errorAz = (int32_t)sensors.light_right - (int32_t)sensors.light_left;
+    
+    if(errorAz > TRACKING_DEADBAND)          // Солнце справа
+      Motor_Azimuth_Right(PWM_AUTO_SPEED);
+    else if(errorAz < -TRACKING_DEADBAND)    // Солнце слева
+      Motor_Azimuth_Left(PWM_AUTO_SPEED);
+    else                                     // В мёртвой зоне - не двигаемся
+      Motor_Azimuth_Stop();
+    
+    // Угол места в данной версии не регулируется автоматически
+    // (можно добавить второй дифференциальный канал или астрономический расчёт)
+  }
+  
+  // ===== РЕЖИМ 2: РУЧНОЕ УПРАВЛЕНИЕ =====
+  else if(systemState == STATE_MANUAL)
+  {
+    // Азимут
+    if(manual_az_cmd == 1)      // Влево
+    {
+      if(!sensors.limit_az_min) Motor_Azimuth_Left(PWM_MANUAL_SPEED);
+      else Motor_Azimuth_Stop();
+    }
+    else if(manual_az_cmd == 2) // Вправо
+    {
+      if(!sensors.limit_az_max) Motor_Azimuth_Right(PWM_MANUAL_SPEED);
+      else Motor_Azimuth_Stop();
+    }
+    else Motor_Azimuth_Stop();
+    
+    // Угол места
+    if(manual_el_cmd == 1)      // Вниз
+    {
+      if(!sensors.limit_el_min) Motor_Elevation_Down(PWM_MANUAL_SPEED);
+      else Motor_Elevation_Stop();
+    }
+    else if(manual_el_cmd == 2) // Вверх
+    {
+      if(!sensors.limit_el_max) Motor_Elevation_Up(PWM_MANUAL_SPEED);
+      else Motor_Elevation_Stop();
+    }
+    else Motor_Elevation_Stop();
+  }
+  
+  // ===== РЕЖИМ 3: НОЧНОЙ РЕЖИМ =====
+  else if(systemState == STATE_NIGHT)
+  {
+    // Переводим панель в безопасное положение (15° согласно чертежу)
+    if(sensors.elevation_deg > 17.0f)      // Выше целевого - опускаем
+      Motor_Elevation_Down(PWM_AUTO_SPEED);
+    else if(sensors.elevation_deg < 13.0f) // Ниже целевого - поднимаем
+      Motor_Elevation_Up(PWM_AUTO_SPEED);
+    else
+      Motor_Elevation_Stop();
+  }
+}
+/*==============================================================================
+  БЛОК 14: ОТПРАВКА ТЕЛЕМЕТРИИ В ESP32
+  ==============================================================================
+  Формат пакета (согласно структурной схеме):
+  <DATA;UP=24.8;IP=8.5;P=210;UB=25.1;IM=2.3;W=3.2;
+        TP=42;TB=31;TI=28;AZ=120;EL=35;LIGHT=512;
+        STATE=1;ALARM=0;PARK=5;ENERGY=1250>
+  
+  Виртуальные пины Blynk (V0-V14) соответствуют документации.
+==============================================================================*/
+void sendTelemetryToESP32(void)
+{
+  char buffer[320];
+  
+  sprintf(buffer, 
+    "<DATA;UP=%.1f;IP=%.2f;P=%.1f;UB=%.1f;IM=%.2f;W=%.1f;"
+    "TP=%.1f;TB=%.1f;TI=%.1f;AZ=%.1f;EL=%.1f;"
+    "LIGHT=%d;STATE=%d;ALARM=%d;PARK=%d;ENERGY=%.0f>\r\n",
+    sensors.voltage_panel_v,      // UP (V0)  - Напряжение панели
+    sensors.current_panel_a,      // IP (V1)  - Ток панели
+    sensors.power_panel_w,        // P  (V2)  - Мощность панели
+    sensors.voltage_battery_v,    // UB (V7)  - Напряжение АКБ
+    sensors.current_motor_a,      // IM (доп) - Ток двигателя
+    sensors.wind_speed_mps,       // W  (V6)  - Скорость ветра
+    sensors.temp_panel_c,         // TP (V4)  - Температура панели
+    sensors.temp_box_c,           // TB (V5)  - Температура шкафа
+    sensors.temp_inverter_c,      // TI (V10) - Температура инвертора
+    sensors.azimuth_deg,          // AZ (V3)  - Азимут
+    sensors.elevation_deg,        // EL (V11) - Угол места
+    (sensors.light_left + sensors.light_right) / 2,  // LIGHT (V13)
+    systemState,                  // STATE (V0, V12)
+    currentAlarm,                 // ALARM (V9)
+    sensors.parking_count,        // PARK (статистика)
+    sensors.energy_today_wh);     // ENERGY (статистика)
+  
+  // Отправляем через UART (блокирующая передача с таймаутом 100 мс)
+  HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), 100);
+}
+/*==============================================================================
+  БЛОК 15: ОТПРАВКА АВАРИИ (СРОЧНОЕ СООБЩЕНИЕ)
+  ==============================================================================
+  При возникновении аварии отправляем отдельный пакет для немедленного
+  уведомления Telegram-бота.
+==============================================================================*/
+void sendAlarmToESP32(void)
+{
+  char buffer[64];
+  sprintf(buffer, "<ALARM;CODE=%d;STATE=%d>\r\n", currentAlarm, systemState);
+  HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), 100);
+}
+/*==============================================================================
+  БЛОК 16: РАСЧЁТ ЭНЕРГИИ ЗА ДЕНЬ
+  ==============================================================================
+  Вызывается каждые 60 секунд.
+  Energy (Wh) = Power (W) * Time (hours)
+  За 1 минуту: Energy = Power / 60
+==============================================================================*/
+void calculateEnergy(void)
+{
+  // Прибавляем энергию за последнюю минуту
+  float energy_increment = sensors.power_panel_w / 60.0f;
+  energy_accumulator += energy_increment;
+  
+  // Сброс счётчика в полночь (упрощённо - когда накоплено >20 кВт·ч)
+  if(energy_accumulator > 20000.0f)
+  {
+    sensors.energy_today_wh = 0;
+    energy_accumulator = 0;
+  }
+  else
+  {
+    sensors.energy_today_wh = energy_accumulator;
+  }
+}
+/*==============================================================================
+  БЛОК 17: ОБНОВЛЕНИЕ LCD 1602
+  ==============================================================================
+  Отображаем на двух строках:
+  - Строка 0: режим работы + индикатор аварии
+  - Строка 1: циклически мощность/ветер/углы (переключение каждые 3 секунды)
+==============================================================================*/
+void updateLCD(void)
+{
+  static uint8_t displayPage = 0;           // Текущая страница (0,1,2)
+  static uint32_t lastPageSwitch = 0;       // Время последнего переключения
+  
+  // Переключение страницы каждые 3 секунды
+  if(HAL_GetTick() - lastPageSwitch >= 3000)
+  {
+    lastPageSwitch = HAL_GetTick();
+    displayPage = (displayPage + 1) % 3;
+  }
+  
+  // ----- СТРОКА 0: РЕЖИМ -----
+  LCD_SetCursor(0, 0);
+  switch(systemState)
+  {
+    case STATE_AUTO:    LCD_Print("AUTO  "); break;
+    case STATE_MANUAL:  LCD_Print("MANUAL"); break;
+    case STATE_NIGHT:   LCD_Print("NIGHT "); break;
+    case STATE_PARKING: LCD_Print("PARK >"); break;
+    case STATE_PARKED:  LCD_Print("PARKED"); break;
+    default:            LCD_Print("INIT  "); break;
+  }
+  
+  // Индикатор аварии
+  if(currentAlarm != ALARM_NONE)
+    LCD_Print(" !ALM!");
+  else
+    LCD_Print("      ");
+  
+  // ----- СТРОКА 1: ДАННЫЕ (ЦИКЛИЧЕСКИ) -----
+  LCD_SetCursor(0, 1);
+  char buf[17];
+  
+  switch(displayPage)
+  {
+    case 0:  // Страница 0: Мощность и напряжение
+      sprintf(buf, "P:%.0fW U:%.1fV", sensors.power_panel_w, sensors.voltage_panel_v);
+      LCD_Print(buf);
+      break;
+      
+    case 1:  // Страница 1: Ветер и температура
+      sprintf(buf, "W:%.1f T:%.0f", sensors.wind_speed_mps, sensors.temp_panel_c);
+      LCD_Print(buf);
+      break;
+      
+    case 2:  // Страница 2: Углы панели
+      sprintf(buf, "AZ:%.0f EL:%.0f", sensors.azimuth_deg, sensors.elevation_deg);
+      LCD_Print(buf);
+      break;
+  }
+}
+/*==============================================================================
+  БЛОК 18: ДРАЙВЕРЫ ДВИГАТЕЛЕЙ (BTS7960)
+  ==============================================================================
+  BTS7960 - полномостовой драйвер с ШИМ-управлением.
+  Логика управления:
+  - RPWM = ШИМ, LPWM = 0 -> вращение вперёд
+  - RPWM = 0, LPWM = ШИМ -> вращение назад
+  - EN = 1 -> драйвер включён
+==============================================================================*/
+// АЗИМУТ: ВЛЕВО (вращение в отрицательную сторону)
+void Motor_Azimuth_Left(uint8_t speedPercent)
+{
+  uint16_t pwm = (speedPercent * 1000) / 100;  // Преобразуем 0-100% в 0-1000
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);     // RPWM = 0
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pwm);   // LPWM = скорость
+  HAL_GPIO_WritePin(AZ_EN_GPIO_Port, AZ_EN_Pin, GPIO_PIN_SET);
+}
+// АЗИМУТ: ВПРАВО (вращение в положительную сторону)
+void Motor_Azimuth_Right(uint8_t speedPercent)
+{
+  uint16_t pwm = (speedPercent * 1000) / 100;
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pwm);   // RPWM = скорость
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);     // LPWM = 0
+  HAL_GPIO_WritePin(AZ_EN_GPIO_Port, AZ_EN_Pin, GPIO_PIN_SET);
+}
+// АЗИМУТ: ОСТАНОВКА
+void Motor_Azimuth_Stop(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+  HAL_GPIO_WritePin(AZ_EN_GPIO_Port, AZ_EN_Pin, GPIO_PIN_RESET);
+}
+// УГОЛ МЕСТА: ВВЕРХ (подъём панели)
+void Motor_Elevation_Up(uint8_t speedPercent)
+{
+  uint16_t pwm = (speedPercent * 1000) / 100;
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm);   // RPWM = скорость
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);     // LPWM = 0
+  HAL_GPIO_WritePin(EL_EN_GPIO_Port, EL_EN_Pin, GPIO_PIN_SET);
+}
+// УГОЛ МЕСТА: ВНИЗ (опускание панели)
+void Motor_Elevation_Down(uint8_t speedPercent)
+{
+  uint16_t pwm = (speedPercent * 1000) / 100;
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);     // RPWM = 0
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm);   // LPWM = скорость
+  HAL_GPIO_WritePin(EL_EN_GPIO_Port, EL_EN_Pin, GPIO_PIN_SET);
+}
+// УГОЛ МЕСТА: ОСТАНОВКА
+void Motor_Elevation_Stop(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+  HAL_GPIO_WritePin(EL_EN_GPIO_Port, EL_EN_Pin, GPIO_PIN_RESET);
+}
+// ОСТАНОВКА ВСЕХ ДВИГАТЕЛЕЙ
+void Motor_All_Stop(void)
+{
+  Motor_Azimuth_Stop();
+  Motor_Elevation_Stop();
+}
+/*==============================================================================
+  БЛОК 19: ДРАЙВЕРЫ ДАТЧИКОВ (STUB-реализации)
+  ==============================================================================
+  В реальном проекте эти функции содержат код для работы с датчиками.
+  Здесь представлены заглушки для компиляции.
+==============================================================================*/
+// AS5600 - магнитный энкодер (I2C)
+void AS5600_Init(void) { /* Инициализация I2C уже выполнена */ }
+float AS5600_ReadAngle(uint8_t addr)
+{
+  // Регистры AS5600:
+  // 0x0C - старший байт угла
+  // 0x0D - младший байт угла
+  // Возвращает угол в градусах (0-360)
+  uint8_t data[2];
+  // HAL_I2C_Mem_Read(&hi2c1, addr << 1, 0x0C, 1, data, 2, 100);
+  // return ((data[0] << 8) | data[1]) * 360.0f / 4096.0f;
+  return 0.0f;  // Заглушка
+}
+// INA219 - монитор напряжения/тока (I2C)
+void INA219_Init(void) { /* Калибровка и настройка */ }
+float INA219_ReadVoltage(uint8_t addr)
+{
+  // Регистр 0x02 (Bus Voltage)
+  return 0.0f;  // Заглушка
+}
+float INA219_ReadCurrent(uint8_t addr)
+{
+  // Регистр 0x04 (Current)
+  return 0.0f;  // Заглушка
+}
+// DS18B20 - цифровой термометр (1-Wire)
+void DS18B20_Init(void) { /* Поиск устройств на шине */ }
+float DS18B20_ReadTemp(uint8_t sensor_id)
+{
+  // Отправка команды 0x44 (конвертация)
+  // Чтение регистра 0xBE (температура)
+  return 0.0f;  // Заглушка
+}
+// WF105 - анемометр (аналоговый 0-5В -> 0-30 м/с)
+float WF105_ReadWindSpeed(void)
+{
+  HAL_ADC_Start(&hadc1);
+  HAL_ADC_PollForConversion(&hadc1, 100);
+  uint32_t adc_value = HAL_ADC_GetValue(&hadc1);
+  HAL_ADC_Stop(&hadc1);
+  
+  float voltage = (adc_value * 5.0f) / 4095.0f;  // 0-5В
+  return voltage * 6.0f;  // 30 м/с / 5В = 6
+}
+// Фотодиоды (аналоговые, АЦП)
+uint16_t readLightSensor(uint8_t channel)
+{
+  // Выбор канала мультиплексора и чтение
+  return 2048;  // Заглушка - середина диапазона
+}
+// LCD 1602 (символьный дисплей)
+void LCD_Init(void) { /* Инициализация HD44780 */ }
+void LCD_Clear(void) { /* Очистка экрана */ }
+void LCD_SetCursor(uint8_t col, uint8_t row) { /* Установка позиции */ }
+void LCD_Print(const char* str) { /* Вывод строки */ }
