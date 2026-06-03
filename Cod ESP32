@@ -1,0 +1,523 @@
+/* ============================================================================
+   ФАЙЛ: esp32_solar_tracker.ino
+   ПРОЕКТ: Интеллектуальная система управления солнечной электростанцией
+   АВТОР: Темербеков М.Б.
+   КОНТРОЛЛЕР: ESP32-S3 (Xtensa LX7, 240 МГц, 512KB RAM)
+   НАЗНАЧЕНИЕ:
+   - Верхнеуровневый контроллер связи (ВЕРХНИЙ УРОВЕНЬ)
+   - Подключение к Wi-Fi и Blynk IoT
+   - Приём данных от STM32 по UART
+   - Отправка данных в Blynk (виртуальные пины V0-V14)
+   - Приём команд из Blynk (виртуальные пины V15-V23)
+   - Передача команд в STM32 по UART
+   - Telegram-бот для аварийных уведомлений
+   - Контроль связи со STM32
+   ВАЖНО: ESP32 НЕ УПРАВЛЯЕТ ДВИГАТЕЛЯМИ НАПРЯМУЮ!
+   Все команды передаются в STM32 для выполнения с проверкой защит.
+   ============================================================================ */
+/*------------------------------------------------------------------------------
+  БЛОК 1: ПОДКЛЮЧЕНИЕ БИБЛИОТЕК
+------------------------------------------------------------------------------*/
+#include <WiFi.h>                    // Wi-Fi подключение (802.11 b/g/n)
+#include <BlynkSimpleEsp32.h>        // Blynk IoT для ESP32
+#include <HardwareSerial.h>          // Аппаратный UART (RX/TX буферы)
+#include <UniversalTelegramBot.h>    // Telegram Bot API
+#include <WiFiClientSecure.h>        // HTTPS для Telegram
+/*------------------------------------------------------------------------------
+  БЛОК 2: КОНФИГУРАЦИЯ BLYNK (ЗАМЕНИТЬ НА СВОИ!)
+  Данные берутся из Blynk.Console после создания устройства
+------------------------------------------------------------------------------*/
+#define BLYNK_TEMPLATE_ID   "TMPLxxxxxx"   // ID шаблона
+#define BLYNK_DEVICE_NAME   "SolarTracker" // Имя устройства
+#define BLYNK_AUTH_TOKEN    "your_blynk_token"  // Токен авторизации
+/*------------------------------------------------------------------------------
+  БЛОК 3: КОНФИГУРАЦИЯ Wi-Fi (ЗАМЕНИТЬ НА СВОИ!)
+------------------------------------------------------------------------------*/
+char ssid[] = "YourWiFiSSID";        // Имя Wi-Fi сети (2.4 ГГц)
+char pass[] = "YourWiFiPassword";    // Пароль
+/*------------------------------------------------------------------------------
+  БЛОК 4: КОНФИГУРАЦИЯ TELEGRAM БОТА
+  Создать бота: @BotFather в Telegram
+  Получить chat_id: @userinfobot
+------------------------------------------------------------------------------*/
+#define TELEGRAM_BOT_TOKEN  "your_telegram_bot_token"  // Токен от BotFather
+#define TELEGRAM_CHAT_ID    "your_chat_id"             // ID вашего чата
+/*------------------------------------------------------------------------------
+  БЛОК 5: НАСТРОЙКИ UART ДЛЯ СВЯЗИ СО STM32
+  ESP32-S3: UART2 на GPIO16 (RX) и GPIO17 (TX)
+  Скорость 115200 бод должна совпадать с настройкой STM32
+------------------------------------------------------------------------------*/
+#define STM32_SERIAL        Serial2                    // UART2
+#define STM32_BAUD          115200                     // Скорость обмена
+#define STM32_RX_PIN        16                         // RX на GPIO16
+#define STM32_TX_PIN        17                         // TX на GPIO17
+/*------------------------------------------------------------------------------
+  БЛОК 6: ВИРТУАЛЬНЫЕ ПИНЫ BLYNK (СОГЛАСНО ДОКУМЕНТАЦИИ изображение.png)
+  В Blynk виртуальные пины - это каналы передачи данных между устройством
+  и приложением. НЕ путать с физическими GPIO!
+  V0-V14: Исходящие данные (STM32 → ESP32 → Blynk)
+  V15-V23: Входящие команды (Blynk → ESP32 → STM32)
+------------------------------------------------------------------------------*/
+// ===== ИСХОДЯЩИЕ ДАННЫЕ (отображение в Blynk) =====
+#define V_MODE              V0   // Режим работы (AUTO/MANUAL/PARKING/PARKED)
+#define V_CURRENT_PANEL     V1   // Ток солнечной панели (А) - INA219
+#define V_POWER_PANEL       V2   // Мощность солнечной панели (Вт) - U*I
+#define V_TRACKER_AXIS      V3   // Ось трекера (угол азимута) - AS5600
+#define V_TEMP_PANEL        V4   // Температура панели (°C) - DS18B20
+#define V_TEMP_BOX          V5   // Температура шкафа (°C) - DS18B20
+#define V_WIND_SPEED        V6   // Скорость ветра (м/с) - WF105
+#define V_BATTERY_POS       V7   // Положение/напряжение аккумулятора (В)
+#define V_LIMIT_AZ          V8   // Ограничение азимута (концевики)
+#define V_BATTERY_ALARM     V9   // Авария аккумулятора (код ошибки)
+#define V_TEMP_INVERTER     V10  // Температура инвертора (°C)
+#define V_3D_POSITION       V11  // 3D позиция трекера (угол места)
+#define V_MODE_POSITION     V12  // Положение режима (дублирует V0)
+#define V_LIGHT             V13  // Освещённость (фотодиоды)
+#define V_COMM_MODE         V14  // Режим связи (STM32/ESP32 статус)
+// ===== ВХОДЯЩИЕ КОМАНДЫ (управление с телефона) =====
+#define V_CMD_AUTO          V15  // Кнопка: автоматический режим
+#define V_CMD_MANUAL        V16  // Кнопка: ручной режим
+#define V_CMD_PARK          V17  // Кнопка: аварийная парковка
+#define V_CMD_STOP          V18  // Кнопка: экстренная остановка
+#define V_CMD_AZ_PLUS       V19  // Кнопка: азимут вправо
+#define V_CMD_AZ_MINUS      V20  // Кнопка: азимут влево
+#define V_CMD_EL_PLUS       V21  // Кнопка: угол места вверх
+#define V_CMD_EL_MINUS      V22  // Кнопка: угол места вниз
+#define V_CMD_CALIBRATE     V23  // Кнопка: калибровка
+/*------------------------------------------------------------------------------
+  БЛОК 7: ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+------------------------------------------------------------------------------*/
+String stm32Data = "";                     // Буфер для накопления строки от STM32
+unsigned long lastSTM32Heartbeat = 0;      // Время последнего получения данных
+bool stm32Connected = false;               // Флаг связи со STM32
+bool lastAlarmState = false;               // Флаг предыдущего состояния аварии
+int lastAlarmCode = 0;                     // Последний код аварии
+BlynkTimer timer;                          // Таймер для периодических задач
+// Telegram бот (HTTPS клиент с отключённой проверкой сертификата)
+WiFiClientSecure securedClient;
+UniversalTelegramBot bot(TELEGRAM_BOT_TOKEN, securedClient);
+/*------------------------------------------------------------------------------
+  БЛОК 8: ОТПРАВКА УВЕДОМЛЕНИЯ В TELEGRAM
+  ==============================================================================
+  При возникновении аварии (код 1-6) отправляем сообщение с пояснением.
+  Это критически важно для дипломного проекта - система оповещений!
+------------------------------------------------------------------------------*/
+void sendTelegramAlert(int alarmCode, int systemState)
+{
+  String message = "⚠️ SOLAR TRACKER ALERT! ⚠️\n\n";
+  // Формируем сообщение в зависимости от типа аварии
+  switch(alarmCode)
+  {
+    case 1:
+      message += "💨 WIND SPEED > 15 m/s!\n";
+      message += "Emergency parking activated. Panel moved to horizontal position.";
+      break;
+    case 2:
+      message += "🔋 LOW BATTERY VOLTAGE!\n";
+      message += "System voltage below 21V. Check battery health.";
+      break;
+    case 3:
+      message += "🌡️ PANEL OVERHEAT!\n";
+      message += "Temperature > 75°C. Efficiency decreased.";
+      break;
+    case 4:
+      message += "📦 CABINET OVERHEAT!\n";
+      message += "Temperature > 50°C. Check ventilation.";
+      break;
+    case 5:
+      message += "⚙️ MOTOR OVERLOAD!\n";
+      message += "Current exceeds 15A. Mechanical obstruction possible.";
+      break;
+    case 6:
+      message += "📡 STM32-ESP32 COMMUNICATION LOST!\n";
+      message += "Check UART connection and power supply.";
+      break;
+    default:
+      message += "Unknown alarm condition.";
+      break;
+  }
+  // Добавляем состояние системы
+  message += "\n\nSystem state: ";
+  switch(systemState)
+  {
+    case 0: message += "INIT (Initialization)"; break;
+    case 1: message += "AUTO (Automatic tracking)"; break;
+    case 2: message += "MANUAL (Manual control)"; break;
+    case 3: message += "NIGHT (Night mode)"; break;
+    case 4: message += "PARKING (Moving to safe position)"; break;
+    case 5: message += "PARKED (Safe position)"; break;
+    default: message += "UNKNOWN";
+  }
+  // Отправляем сообщение (неблокирующая отправка)
+  bot.sendMessage(TELEGRAM_CHAT_ID, message, "");
+  Serial.println("[Telegram] Alert sent");
+}
+/*------------------------------------------------------------------------------
+  БЛОК 9: ОТПРАВКА КОМАНДЫ В STM32
+  ==============================================================================
+  Формат: <CMD;КОМАНДА>
+  Примеры: <CMD;AUTO>, <CMD;AZ_PLUS>, <CMD;PARK>
+------------------------------------------------------------------------------*/
+void sendCommandToSTM32(const char* cmd)
+{
+  char buffer[32];
+  sprintf(buffer, "<CMD;%s>\r\n", cmd);   // Форматируем команду
+  STM32_SERIAL.print(buffer);              // Отправляем в STM32
+  Serial.print("[STM32 TX] ");
+  Serial.println(buffer);
+}
+/*------------------------------------------------------------------------------
+  БЛОК 10: ИЗВЛЕЧЕНИЕ ЧИСЛОВЫХ ЗНАЧЕНИЙ ИЗ СТРОКИ
+  ==============================================================================
+  Парсинг строки вида: "...KEY=123.45;..."
+  Возвращает значение как float или int
+------------------------------------------------------------------------------*/
+float extractValue(String str, String key)
+{
+  // Находим позицию ключа
+  int start = str.indexOf(key) + key.length();
+  int end = str.indexOf(';', start);      // Ищем разделитель ';'
+  if(end == -1) end = str.indexOf('>', start); // Или конец пакета '>'
+  if(end == -1) end = str.length();
+  return str.substring(start, end).toFloat();
+}
+int extractIntValue(String str, String key)
+{
+  int start = str.indexOf(key) + key.length();
+  int end = str.indexOf(';', start);
+  if(end == -1) end = str.indexOf('>', start);
+  if(end == -1) end = str.length();
+  return str.substring(start, end).toInt();
+}
+/*------------------------------------------------------------------------------
+  БЛОК 11: ПАРСИНГ ДАННЫХ ОТ STM32
+  ==============================================================================
+  Ожидаемые форматы:
+  1. DATA: <DATA;UP=24.8;IP=8.5;P=210;UB=25.1;...>
+  2. ALARM: <ALARM;CODE=1;STATE=4>
+  Все значения отправляются на соответствующие виртуальные пины Blynk.
+------------------------------------------------------------------------------*/
+void parseSTM32Data(String data)
+{
+  // ----- ОБРАБОТКА АВАРИЙНОГО СООБЩЕНИЯ (приоритет) -----
+  if(data.indexOf("ALARM") != -1)
+  {
+    int code = extractIntValue(data, "CODE=");
+    int state = extractIntValue(data, "STATE=");
+    // Отправляем Telegram только при возникновении НОВОЙ аварии
+    if(code != 0 && !lastAlarmState)
+    {
+      lastAlarmState = true;
+      lastAlarmCode = code;
+      sendTelegramAlert(code, state);
+    }
+    else if(code == 0)
+    {
+      lastAlarmState = false;  // Авария устранена
+    }
+    return;  // Не обрабатываем остальные данные
+  }
+  // ----- ОБРАБОТКА ТЕЛЕМЕТРИИ (DATA пакет) -----
+  // V0 - Режим работы (и V12 дублирует)
+  if(data.indexOf("STATE=") != -1)
+  {
+    int state = extractIntValue(data, "STATE=");
+    Blynk.virtualWrite(V_MODE, state);
+    Blynk.virtualWrite(V_MODE_POSITION, state);
+  }
+  // V1 - Ток панели
+  if(data.indexOf("IP=") != -1)
+  {
+    float val = extractValue(data, "IP=");
+    Blynk.virtualWrite(V_CURRENT_PANEL, val);
+  }
+  // V2 - Мощность панели
+  if(data.indexOf("P=") != -1)
+  {
+    float val = extractValue(data, "P=");
+    Blynk.virtualWrite(V_POWER_PANEL, val);
+  }
+  // V3 - Ось трекера (азимут)
+  if(data.indexOf("AZ=") != -1)
+  {
+    float val = extractValue(data, "AZ=");
+    Blynk.virtualWrite(V_TRACKER_AXIS, val);
+  }
+  // V4 - Температура панели
+  if(data.indexOf("TP=") != -1)
+  {
+    float val = extractValue(data, "TP=");
+    Blynk.virtualWrite(V_TEMP_PANEL, val);
+  }
+  // V5 - Температура шкафа
+  if(data.indexOf("TB=") != -1)
+  {
+    float val = extractValue(data, "TB=");
+    Blynk.virtualWrite(V_TEMP_BOX, val);
+  }
+  // V6 - Скорость ветра
+  if(data.indexOf("W=") != -1)
+  {
+    float val = extractValue(data, "W=");
+    Blynk.virtualWrite(V_WIND_SPEED, val);
+  }
+  // V7 - Напряжение аккумулятора
+  if(data.indexOf("UB=") != -1)
+  {
+    float val = extractValue(data, "UB=");
+    Blynk.virtualWrite(V_BATTERY_POS, val);
+  }
+  // V8 - Ограничение азимута (концевики) - заглушка
+  // В полной версии нужно передавать состояние концевиков
+  // V9 - Авария аккумулятора
+  if(data.indexOf("ALARM=") != -1)
+  {
+    int val = extractIntValue(data, "ALARM=");
+    Blynk.virtualWrite(V_BATTERY_ALARM, val);
+  }
+  // V10 - Температура инвертора
+  if(data.indexOf("TI=") != -1)
+  {
+    float val = extractValue(data, "TI=");
+    Blynk.virtualWrite(V_TEMP_INVERTER, val);
+  }
+  // V11 - 3D позиция (угол места)
+  if(data.indexOf("EL=") != -1)
+  {
+    float val = extractValue(data, "EL=");
+    Blynk.virtualWrite(V_3D_POSITION, val);
+  }
+  // V13 - Освещённость
+  if(data.indexOf("LIGHT=") != -1)
+  {
+    int val = extractIntValue(data, "LIGHT=");
+    Blynk.virtualWrite(V_LIGHT, val);
+  }
+  // V14 - Режим связи (статус STM32)
+  Blynk.virtualWrite(V_COMM_MODE, stm32Connected ? 1 : 0);
+  // Дополнительно: выработка энергии (можно вывести на отдельный виджет)
+  if(data.indexOf("ENERGY=") != -1)
+  {
+    float energy = extractValue(data, "ENERGY=");
+    Blynk.virtualWrite(V10, energy);  // Используем V10 для энергии
+  }
+  // Обновляем время получения данных (для контроля связи)
+  lastSTM32Heartbeat = millis();
+  // Если связь восстановилась - логируем
+  if(!stm32Connected)
+  {
+    stm32Connected = true;
+    Serial.println("[STM32] Connected");
+    Blynk.logEvent("stm32_connected", "STM32 connected");
+  }
+}
+/*------------------------------------------------------------------------------
+  БЛОК 12: ОБРАБОТЧИКИ КОМАНД ИЗ BLYNK
+  ==============================================================================
+  При нажатии кнопок в приложении Blynk вызываются эти функции.
+  Они отправляют соответствующие команды в STM32.
+------------------------------------------------------------------------------*/
+// Кнопка AUTO - автоматический режим
+BLYNK_WRITE(V_CMD_AUTO)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("AUTO");
+    Serial.println("[Blynk] AUTO command");
+  }
+}
+// Кнопка MANUAL - ручной режим
+BLYNK_WRITE(V_CMD_MANUAL)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("MANUAL");
+    Serial.println("[Blynk] MANUAL command");
+  }
+}
+// Кнопка PARK - аварийная парковка
+BLYNK_WRITE(V_CMD_PARK)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("PARK");
+    Serial.println("[Blynk] PARK command");
+  }
+}
+// Кнопка STOP - экстренная остановка
+BLYNK_WRITE(V_CMD_STOP)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("STOP");
+    Serial.println("[Blynk] STOP command");
+  }
+}
+// Кнопка AZ+ (азимут вправо) - при нажатии двигатель вращается,
+// при отпускании - останавливается
+BLYNK_WRITE(V_CMD_AZ_PLUS)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("AZ_PLUS");
+    Serial.println("[Blynk] AZ_PLUS command");
+  }
+  else
+  {
+    sendCommandToSTM32("STOP");
+  }
+}
+// Кнопка AZ- (азимут влево)
+BLYNK_WRITE(V_CMD_AZ_MINUS)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("AZ_MINUS");
+    Serial.println("[Blynk] AZ_MINUS command");
+  }
+  else
+  {
+    sendCommandToSTM32("STOP");
+  }
+}
+// Кнопка EL+ (угол места вверх)
+BLYNK_WRITE(V_CMD_EL_PLUS)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("EL_PLUS");
+    Serial.println("[Blynk] EL_PLUS command");
+  }
+  else
+  {
+    sendCommandToSTM32("STOP");
+  }
+}
+// Кнопка EL- (угол места вниз)
+BLYNK_WRITE(V_CMD_EL_MINUS)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("EL_MINUS");
+    Serial.println("[Blynk] EL_MINUS command");
+  }
+  else
+  {
+    sendCommandToSTM32("STOP");
+  }
+}
+// Кнопка CALIBRATE - калибровка
+BLYNK_WRITE(V_CMD_CALIBRATE)
+{
+  if(param.asInt())
+  {
+    sendCommandToSTM32("CALIBRATE");
+    Serial.println("[Blynk] CALIBRATE command");
+  }
+}
+/*------------------------------------------------------------------------------
+  БЛОК 13: ПЕРИОДИЧЕСКИЕ ЗАДАЧИ (BlynkTimer)
+  ==============================================================================
+  - sendHeartbeat(): отправка "PING" в STM32 каждые 5 секунд
+  - checkSTM32Connection(): проверка связи со STM32 каждые 10 секунд
+------------------------------------------------------------------------------*/
+// Отправка heartbeat для поддержания связи
+void sendHeartbeat()
+{
+  sendCommandToSTM32("PING");
+}
+// Проверка связи со STM32
+void checkSTM32Connection()
+{
+  // Если нет данных от STM32 более 10 секунд
+  if(millis() - lastSTM32Heartbeat > 10000)
+  {
+    if(stm32Connected)
+    {
+      stm32Connected = false;
+      Blynk.virtualWrite(V_COMM_MODE, 0);  // Сигнализируем о потере связи
+      Serial.println("[ERROR] STM32 connection lost!");
+      Blynk.logEvent("stm32_lost", "STM32 communication lost");
+      // Отправляем Telegram о потере связи
+      if(WiFi.status() == WL_CONNECTED)
+      {
+        sendTelegramAlert(6, -1);  // Код 6 = потеря связи
+      }
+    }
+  }
+}
+/*------------------------------------------------------------------------------
+  БЛОК 14: ФУНКЦИЯ SETUP()
+  ==============================================================================
+  Выполняется один раз при включении питания.
+  Инициализирует UART, Wi-Fi, Blynk, Telegram.
+------------------------------------------------------------------------------*/
+void setup()
+{
+  // ----- 1. ИНИЦИАЛИЗАЦИЯ ПОСЛЕДОВАТЕЛЬНОГО ПОРТА (отладка) -----
+  Serial.begin(115200);
+  Serial.println("\n[ESP32] Solar Tracker Starting...");
+  // ----- 2. ИНИЦИАЛИЗАЦИЯ UART ДЛЯ СВЯЗИ СО STM32 -----
+  STM32_SERIAL.begin(STM32_BAUD, SERIAL_8N1, STM32_RX_PIN, STM32_TX_PIN);
+  Serial.println("[UART] STM32 UART initialized at 115200 baud");
+  // ----- 3. ПОДКЛЮЧЕНИЕ К Wi-Fi -----
+  Serial.print("[WiFi] Connecting to ");
+  Serial.print(ssid);
+  WiFi.begin(ssid, pass);
+  int attempts = 0;
+  while(WiFi.status() != WL_CONNECTED && attempts < 40)  // Таймаут 20 секунд
+  {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if(WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\n[WiFi] Connected!");
+    Serial.print("[WiFi] IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println("\n[WiFi] Connection failed!");
+  }
+  // ----- 4. НАСТРОЙКА TELEGRAM (HTTPS без проверки сертификата) -----
+  securedClient.setInsecure();  // Отключаем проверку SSL (упрощённо)
+  // ----- 5. ПОДКЛЮЧЕНИЕ К BLYNK -----
+  Serial.println("[Blynk] Connecting...");
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+  // ----- 6. НАСТРОЙКА ТАЙМЕРОВ -----
+  timer.setInterval(5000L, sendHeartbeat);        // Heartbeat каждые 5 секунд
+  timer.setInterval(10000L, checkSTM32Connection); // Проверка связи каждые 10 сек
+  // ----- 7. ФИНАЛЬНАЯ НАСТРОЙКА -----
+  lastSTM32Heartbeat = millis();
+  Serial.println("[ESP32] Setup complete, entering main loop");
+}
+/*------------------------------------------------------------------------------
+  БЛОК 15: ФУНКЦИЯ LOOP()
+------------------------------------------------------------------------------*/
+void loop()
+{
+  Blynk.run();      // Обработка входящих событий Blynk
+  timer.run();      // Выполнение периодических задач
+  // ----- ЧТЕНИЕ ДАННЫХ ОТ STM32 -----
+  while(STM32_SERIAL.available())
+  {
+    char c = STM32_SERIAL.read();
+    if(c == '<')
+    {
+      stm32Data = "";           // Начинаем новый пакет
+    }
+    else if(c == '>')
+    {
+      parseSTM32Data(stm32Data); // Пакет завершён - парсим
+      stm32Data = "";
+    }
+    else
+    {
+      stm32Data += c;           // Добавляем символ в буфер
+    }
+  }
+  delay(10);  // Небольшая задержка для снижения нагрузки
+}
